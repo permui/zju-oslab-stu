@@ -10,39 +10,52 @@
 
 ## 3 背景知识
 
-### 3.0 前言
-在 [lab3](./lab3.md) 中我们赋予了 OS 对多个线程调度以及并发执行的能力，由于目前这些线程都是内核线程，因此他们可以共享运行空间，即运行不同线程对空间的修改是相互可见的。但是如果我们需要线程相互**隔离**，以及在多线程的情况下更加**高效**的使用内存，我们必须引入`虚拟内存`这个概念。
+在 [lab3](./lab3.md) 中我们赋予了 OS 对多个线程调度以及并发执行的能力，由于目前这些线程都是内核线程，因此他们可以共享运行空间，即运行不同线程对空间的修改是相互可见的。但是如果我们需要线程相互**隔离**，以及在多线程的情况下更加**高效**的使用内存，我们必须引入*虚拟内存*这个概念。
 
-虚拟内存可以为正在运行的进程提供独立的内存空间，制造一种每个进程的内存都是独立的假象。同时虚拟内存到物理内存的映射也包含了对内存的访问权限，方便 Kernel 完成权限检查。
+虚拟内存可以为进程提供独立的内存空间，制造一种每个进程的内存都是独立的假象。虚拟内存到物理内存的映射也包含了内存访问权限的信息，方便 kernel 完成权限检查。
 
-在本次实验中，我们需要关注 OS 如何**开启虚拟地址**以及通过设置页表来实现**地址映射**和**权限控制**。
+在本次实验中，我们需要关注 OS 如何**开启虚拟内存**，如何通过设置页表来实现**地址映射**和**权限控制**。
 
-### 3.1 Kernel 的虚拟内存布局
+### 3.1 Linux Kernel 的虚拟内存布局
 
 ```
 start_address           end_address
     0x0                 0x3fffffffff
      │                       │
-┌────┘                 ┌─────┘
-↓        256G          ↓                                
+┌────┘                  ┌────┘
+↓        256G           ↓                                
 ┌───────────────────────┬──────────┬────────────────┐
 │      User Space       │    ...   │  Kernel Space  │
 └───────────────────────┴──────────┴────────────────┘
-                                    ↑    256G      ↑
-                      ┌─────────────┘              │ 
-                      │                            │
-              0xffffffc000000000          0xffffffffffffffff
-                start_address                 end_address
+                                   ↑     256G       ↑
+                      ┌────────────┘                │ 
+                      │                             │
+              0xffffffc000000000           0xffffffffffffffff
+                start_address                  end_address
 ```
-通过上图我们可以看到 RV64 将 `0x0000004000000000` 以下的虚拟空间作为 `user space`。 将 `0xffffffc000000000` 及以上的虚拟空间作为 `kernel space`。由于我们还未引入用户态程序，目前我们只需要关注 `kernel space`。
+上图是 Linux 5.15 中 RV64 架构的内存布局。它是基于 RISC-V 标准中定义的 Sv39 地址转换模式的（见下文）。我们看到 `0x0000004000000000` 以下的虚拟地址空间分配给 user space，`0xffffffc000000000` 及以上的虚拟地址空间分配给 `kernel space`。由于我们还未引入用户态程序，目前我们只需要关注 `kernel space`。原始说明文件在[此处](https://elixir.bootlin.com/linux/v5.15/source/Documentation/riscv/vm-layout.rst)。
 
-具体的虚拟内存布局可以[参考这里](https://elixir.bootlin.com/linux/v5.15/source/Documentation/riscv/vm-layout.rst)
+Kernel 为了高效方便地访问 RAM，会把所有物理内存都映射到虚拟内存里 kernel space 中的一块区域。这块区域称为 *direct mapping area*。由于此处虚拟内存和物理内存的映射关系是 `VA == PA + OFFSET`， 所以这种映射也被称为 *linear mapping*（注意，这与线性代数中的 linear mapping 是不同的——那里的 linear mapping 一定把 0 映射到 0，而此处不是。在数学上此处的映射应称为 translation transformation，即平移变换）。在 RISC-V 架构的 Linux Kernel 中 direct mapping area 为 `0xffffffe000000000 ~ 0xffffffff00000000`, 共 124 GB 。
 
-在 `kernel space` 中有一段区域被称为 `direct mapping area`， 为了方便 kernel 可以高效率的访问 RAM， kernel 会预先把所有物理内存都映射至这一块区域 ( PA + OFFSET == VA )， 这种映射也被称为 `linear mapping`。在 RISC-V Linux Kernel 中这一段区域为 `0xffffffe000000000 ~ 0xffffffff00000000`, 共 124 GB 。
+**本次实验的任务就是开启虚拟内存，实现 direct mapping，并让 lab3 中的多进程程序在 direct mapping area 中执行。**
 
+为此，我们需要了解 RISC-V 架构中虚拟内存的工作方式。
 
-### 3.2 RISC-V Virtual-Memory System (Sv39)
-#### 3.2.1 `satp` Register（Supervisor Address Translation and Protection Register）
+### 3.2 RISC-V Virtual-Memory System
+
+虚拟内存的本质是地址转换与保护，而这是通过页表来实现的。分四步来理解地址转换与保护：
+
+1. S 态下如何开启转换，页表基地址存放在哪里：`satp` register
+2. 我们使用的转换模式下，虚拟地址和物理地址如何划分
+3. 页表项（Page Table Entry, PTE）的格式是什么
+4. 当一切都设置好后，地址转换与保护是如何进行的
+
+下面分别介绍这四点。
+
+#### 3.2.1 The `satp` Register（Supervisor Address Translation and Protection Register）
+
+`satp` 是 S 模式下控制地址转换与保护的 CSR 寄存器，它的格式如下图：
+
 ```c
  63      60 59                  44 43                                0
  ---------------------------------------------------------------------
@@ -50,7 +63,7 @@ start_address           end_address
  ---------------------------------------------------------------------
 ```
 
-* MODE 字段的取值如下图：
+* MODE 字段控制地址转换模式，默认为 0，表示不做转换。它的所有取值如下图。当 `satp.MODE` 被设为 8 时，我们就开启了 Sv39 模式的地址转换。
 ```c
                              RV 64
      ----------------------------------------------------------
@@ -67,8 +80,9 @@ start_address           end_address
      -----------------------------------------------------------
 ```
 * ASID ( Address Space Identifier ) ： 此次实验中直接置 0 即可。
-* PPN ( Physical Page Number ) ：顶级页表的物理页号。我们的物理页的大小为 4KB， PA >> 12 == PPN。
-* 具体介绍请阅读 [RISC-V Privileged Spec 4.1.10](https://www.five-embeddev.com/riscv-isa-manual/latest/supervisor.html#sec:satp)
+* PPN ( Physical Page Number ) ：顶级页表的**物理**页号。在 Sv39 中物理页的大小为 4KiB，所以 `PPN == PA >> 12`。
+
+具体介绍请阅读 [RISC-V Privileged Spec 4.1.10](https://www.five-embeddev.com/riscv-isa-manual/latest/supervisor.html#sec:satp)。
 
 #### 3.2.2 RISC-V Sv39 Virtual Address and Physical Address
 ```c
@@ -88,8 +102,21 @@ start_address           end_address
                             Sv39 physical address
 
 ```
-* Sv39 模式定义物理地址有 56 位，虚拟地址有 64 位。但是，虚拟地址的 64 位只有低 39 位有效，通过 虚拟内存布局图我们可以发现 其 63-39 位 为 0 时代表 user space address， 为 1 时 代表 kernel space address。Sv39 支持三级页表结构，VPN[2-0](Virtual Page Number)分别代表每级页表的`虚拟页号`，PPN[2-0](Physical Page Number)分别代表每级页表的`物理页号`。物理地址和虚拟地址的低12位表示页内偏移（page offset）。
-* 具体介绍请阅读 [RISC-V Privileged Spec 4.4.1](https://www.five-embeddev.com/riscv-isa-manual/latest/supervisor.html#sec:sv39)
+Sv39 模式定义的物理地址有 56 位，虚拟地址有 64 位。但是，虚拟地址的 64 位只有低 39 位有效——在使用 64 位虚拟地址时，必须保证其 63 ~ 39 号位与 38 号位相等，否则就会触发 Page Fault Exception。当虚拟地址的 63 ~ 38 号位都为 0 时，该地址处于 user space 中；都为 1 时处于 kernel space 中。
+
+Sv39 支持三级页表结构。
+
+* VPN (Virtual Page Number) 是虚拟地址所在页的页号，在地址转换中是查询页表所用的下标。VPN[2] ~ VPN[0] 分别用于查询顶级页表、二级页表、三级页表。
+* PPN (Physical Page Number) 是物理地址所在页的页号。
+* Page Offset 是页内偏移。
+
+必须指出，**并不是三级页表都一定要用的：我们可以只用第一级，或只用前两级**。
+
+* 只用第一级页表。此时，假设我们拿 `VA` 中的 `VPN[2]` 查询顶级页表得到的 PTE 中物理页号部分为 `{PPN[2], PPN[1], PPN[0]}`，那么地址转换得到的物理地址就是 `{PPN[2], VPN[1], VPN[0], VA.offset}`。此时虚拟内存的一页大小为 $1 \text{ GiB}$，因为 `{VPN[1], VPN[0], VA.offset}` 连起来被看作页内偏移，一共有 30 位。
+* 只用前两级页表。此时虚拟内存的一页大小就是 $2 \text{ MiB}$ 。
+* 当然，我们可以用三级页表，此时虚拟内存的一页大小就是 $4 \text{ KiB}$。
+
+具体介绍请阅读 [RISC-V Privileged Spec 4.4.1](https://www.five-embeddev.com/riscv-isa-manual/latest/supervisor.html#sec:sv39)。
 
 
 #### 3.2.3 RISC-V Sv39 Page Table Entry
@@ -111,12 +138,13 @@ start_address           end_address
 ```
 
 * 0 ～ 9 bit: protection bits
-    * V : 有效位，当 V = 0, 访问该PTE会产生Pagefault。
+    * V : 有效位。访问到 V = 0 的 PTE 时会产生 Page Fault。
     * R : R = 1 该页可读。
     * W : W = 1 该页可写。
     * X : X = 1 该页可执行。
     * U , G , A , D , RSW 本次实验中设置为 0 即可。
-* 具体介绍请阅读 [RISC-V Privileged Spec 4.4.1](https://www.five-embeddev.com/riscv-isa-manual/latest/supervisor.html#sec:sv39)
+
+具体介绍请阅读 [RISC-V Privileged Spec 4.4.1](https://www.five-embeddev.com/riscv-isa-manual/latest/supervisor.html#sec:sv39)。
 
 
 #### 3.2.4 RISC-V Address Translation
@@ -162,71 +190,119 @@ start_address           end_address
  └────────┘
 ```
 
-## 4 实验步骤
-### 4.1 准备工程
-* 此次实验基于 lab3 同学所实现的代码进行。
-* 需要修改 `defs.h`, 在 `defs.h` `添加` 如下内容：
-    ```c
-    #define OPENSBI_SIZE (0x200000)
+## 4 实验指导
 
-    #define VM_START (0xffffffe000000000)
-    #define VM_END   (0xffffffff00000000)
-    #define VM_SIZE  (VM_END - VM_START)
+### 4.0 任务与途径
 
-    #define PA2VA_OFFSET (VM_START - PHY_START)
-    ```
-* 从 `repo` 同步以下代码: `vmlinux.lds.S`, `Makefile`。并按照以下步骤将这些文件正确放置。
-    ```
-    .
-    └── arch
-        └── riscv
-            └── kernel
-                ├── Makefile
-                └── vmlinux.lds.S
-    ```
-    这里我们通过 `vmlinux.lds.S` 模版生成 `vmlinux.lds`文件。链接脚本中的 `ramv` 代表 `LMA ( Virtual Memory Address )`即虚拟地址， `ram` 则代表 `LMA ( Load Memory Address )`, 即我们 OS image 被 load 的地址，可以理解为物理地址。使用以上的 vmlinux.lds 进行编译之后，得到的 `System.map` 以及 `vmlinux` 采用的都是虚拟地址，方便之后 Debug。
+**本次实验的任务是开启虚拟内存，实现 direct mapping，并让 lab3 中的多进程程序在 direct mapping area 中执行。**
 
-### 4.2 开启虚拟内存映射。
-在 RISC-V 中开启虚拟地址被分为了两步： `setup_vm` 以及 `setup_vm_final`，下面将介绍相关的具体实现。
-#### 4.2.1 `setup_vm` 的实现
-* 将 0x80000000 开始的 1GB 区域进行两次映射，其中一次是等值映射 ( PA == VA ) ，另一次是将其映射至高地址 ( PA + PV2VA_OFFSET == VA )。如下图所示：
-  ```text
-  Physical Address
-  -------------------------------------------
-                       | OpenSBI | Kernel |
-  -------------------------------------------
-                       ^
-                  0x80000000
-                       ├───────────────────────────────────────────────────┐
-                       |                                                   |
-  Virtual Address      ↓                                                   ↓
-  -----------------------------------------------------------------------------------------------
-                       | OpenSBI | Kernel |                                | OpenSBI | Kernel |
-  -----------------------------------------------------------------------------------------------
-                       ^                                                   ^
-                  0x80000000                                       0xffffffe000000000
-  ```
-* 完成上述映射之后，通过 `relocate`函数，完成对 `satp`的设置，以及跳转到对应的虚拟地址。
-* 至此我们已经完成了虚拟地址的开启，之后我们运行的代码也都将在虚拟地址上运行。
+下面描述具体实现方式。为了描述清晰，我们先定义一些记号：
+
+* $p_s$：物理地址的起始地址值，本实验中为 `0x80000000`。
+* $p_e$：物理地址的终止地址值，本实验中为 `0x8020000`。
+* $l$：物理地址段的长度，本实验中为 `0x8000000`，即 128MiB。
+* $b$：为 OpenS**B**I 预留的地址长度，本实验中为 `0x200000`，即 2 MiB。 
+* $v_s$：虚拟地址的起始地址值，本实验中为 `0xffffffe000000000`
+* $v_e$：虚拟地址的终止地址值，本实验中为 `0xffffffe000200000`
+* $t=v_s-p_s$，虚拟地址相对于物理地址的偏移量 (offse**t**)
+* $[a, b)\to [c, d)$：内存映射，把**虚拟地址空间**的 $[a, b)$ 映射到**物理地址空间**的 $[c, d)$。当然，要求两段长度相同。
+
+完美开启虚拟内存分为两步：
+
+**第一回映射，分两块**：
+
+* $[p_s, p_s+d)\to [p_s, p_s+d)$，称为等值映射
+* $[v_s, v_s+d)\to [p_s, p_s+d)$，称为偏移映射（即上文中的 linear mapping）
+
+其中 $d=1\text{ GiB}$。
+
+我们的物理地址段只有 $l=128 \text{ MiB}$ 这么大，为什么要做 $1 \text{ GiB}$ 的映射呢？这仅仅是为了方便。可以想象，如果使用两级或三级页表，就会涉及多个物理页的管理，比较麻烦；若只用第一级页表，我们就只需要一个物理页来存放它，非常方便。因此在第一回映射时我们就只用第一级页表，从而虚拟内存一页的大小就是 $1\text{ GiB}$（见上文）。只要我们实际访问的地址都在 $128 \text{ MiB}$ 的范围内，这样就是无害的。
+
+**第二回映射**：
+
+* $[v_s+b, v_e)\to [p_s+b, p_e)$ 
+
+为什么左端点要加 $b$ 呢？因为 $[v_s, v_s+b)$ 这一段虚拟地址根本就用不着——若要访问这一段，访问到的是 OpenSBI，但我们在 S 态下不会（也不应该）访问它。需要访问它的是 M 态，而 M 态根本不受 `satp`（S 模式的地址转换）影响——在 M 态里程序直接用物理地址 $[p_s, p_s+b)$ 访问 OpenSBI。
+
+第二回映射用三级页表来实现。
+
+第二回映射会覆盖第一回映射。即，当我们把 `satp` 指向承载第二回映射的页表时，第一回映射就自动失效了。最后我们就得到了不多不少刚刚好的虚拟地址到物理地址的映射。
+
+这里留下几个问题（也在思考题中），请同学思考：
+
+* 为什么第一回映射里要做等值映射？
+* 为什么要分这样两步呢？能否一步做完？
+
+下面是具体编程的指引。
+
+### 4.1 准备工作
+此次实验基于 lab3 同学所实现的代码进行。
+
+需要修改 `defs.h`，写入上面定义的常量。在 `defs.h` 中加入如下内容：
+```c
+#define OPENSBI_SIZE (0x200000)
+
+#define VM_START (0xffffffe000000000)
+#define VM_END   (0xffffffff00000000)
+#define VM_SIZE  (VM_END - VM_START)
+
+#define PA2VA_OFFSET (VM_START - PHY_START)
+```
+
+从 `repo` 同步以下代码: `vmlinux.lds.S`, `Makefile`。并按照以下步骤将这些文件正确放置。
+```
+.
+└── arch
+    └── riscv
+        └── kernel
+            ├── Makefile
+            └── vmlinux.lds.S
+```
+这里我们通过 `vmlinux.lds.S` 模版生成 `vmlinux.lds`文件。链接脚本中的 `ramv` 代表 VMA (Virtual Memory Address)，即虚拟地址；`ram` 则代表 LMA (Load Memory Address)，即我们 OS image 被 load 的地址，可以理解为物理地址。使用以上的 `vmlinux.lds` 进行编译之后，得到的 `System.map` 以及 `vmlinux` 采用的都是虚拟地址，方便之后 debug。
+
+### 4.2 第一回映射
+下图描绘了第一回映射的状况：
+```text
+Physical Address
+-------------------------------------------
+                     | OpenSBI | Kernel |
+-------------------------------------------
+                     ^
+                0x80000000
+                     ├───────────────────────────────────────────────────┐
+                     |                                                   |
+Virtual Address      |                                                   |
+-----------------------------------------------------------------------------------------------
+                     | OpenSBI | Kernel |                                | OpenSBI | Kernel |
+-----------------------------------------------------------------------------------------------
+                     ^                                                   ^
+                0x80000000                                       0xffffffe000000000
+```
+
+我们用两个函数实现第一回映射：
+
+* `arch/riscv/kernel/vm.c : setup_vm`：配置好页表；
+* `arch/riscv/kernel/head.S : relocate`：配置 `satp`，并返回到高地址。
+
 ```c
 // arch/riscv/kernel/vm.c
 
-/* early_pgtbl: 用于 setup_vm 进行 1GB 的 映射。 */
+/* early_pgtbl: 第一回映射的页表, 大小恰好为一页 4 KiB, 开头对齐页边界 */
 unsigned long  early_pgtbl[512] __attribute__((__aligned__(0x1000)));
 
 void setup_vm(void) {
     /* 
-    1. 由于是进行 1GB 的映射 这里不需要使用多级页表 
-    2. 将 va 的 64bit 作为如下划分： | high bit | 9 bit | 30 bit |
+    1. 如前文所说，只使用第一级页表
+    2. 因此 VA 的 64bit 作为如下划分： | high bit | 9 bit | 30 bit |
         high bit 可以忽略
-        中间9 bit 作为 early_pgtbl 的 index
-        低 30 bit 作为 页内偏移 这里注意到 30 = 9 + 9 + 12， 即我们只使用根页表， 根页表的每个 entry 都对应 1GB 的区域。 
+        中间 9 bit 作为 early_pgtbl 的 index
+        低 30 bit 作为页内偏移
     3. Page Table Entry 的权限 V | R | W | X 位设置为 1
     */
 }
 ```
 ```asm
-# head.S
+# arch/riscv/kernel/head.S
 
 _start:
 
@@ -263,39 +339,40 @@ boot_stack:
 ```
 
 > Hint 1: `sfence.vma` 指令用于刷新 TLB
-> 
+>
 > Hint 2: 在 set satp 前，我们只可以使用**物理地址**来打断点。设置 satp 之后，才可以使用虚拟地址打断点，同时之前设置的物理地址断点也会失效，需要删除。
+>
+> Hint 3: 如果要调试代码，可以使用 `.gdbinit` 做一些自动化。在启动 GDB 的那个目录下新建 `.gdbinit` 文件，在其中写入 GDB 指令，GDB 就会在启动时自动执行它们。比如在其中写入 `target remote :1234`、打断点指令、执行到断点处的指令，GDB 在启动后就会自动链接上 QEMU，打断点并跳到断点处。这能极大地提升调试体验。
 
+### 4.3 第二回映射
 
+下图描绘了第二回映射的状况：
+```text
+Physical Address
+     PHY_START                           PHY_END
+         ↓                                  ↓
+--------------------------------------------------------
+         | OpenSBI | Kernel |               |
+--------------------------------------------------------
+                   ^                        ^
+               0x80200000                   └───────────────────────────────────────────────────┐
+                   └───────────────────────────────────────────────────┐                        |
+                                                                       |                        |
+                                                                    VM_START                    |
+Virtual Address                                                        |                        |
+----------------------------------------------------------------------------------------------------
+                                                             | OpenSBI | Kernel |               |
+-----------------------------------------------------------------------------------------------------
+                                                                       ^
+                                                               0xffffffe000200000
+```
 
-#### 4.2.2 `setup_vm_final` 的实现
-* 由于 setup_vm_final 中需要申请页面的接口， 应该在其之前完成内存管理初始化， 可能需要修改 mm.c 中的代码，mm.c 中初始化的函数接收的起始结束地址需要调整为虚拟地址。
-* 对 所有物理内存 (128M) 进行映射，并设置正确的权限。
-  ```text
-  Physical Address
-       PHY_START                           PHY_END
-           ↓                                  ↓
-  --------------------------------------------------------
-           | OpenSBI | Kernel |               |
-  --------------------------------------------------------
-           ^                                  ^
-      0x80000000                              └───────────────────────────────────────────────────┐
-           └───────────────────────────────────────────────────┐                                  |
-                                                               |                                  |
-                                                            VM_START                              |
-  Virtual Address                                              ↓                                  ↓
-  ----------------------------------------------------------------------------------------------------
-                                                               | OpenSBI | Kernel |               |
-  -----------------------------------------------------------------------------------------------------
-                                                               ^
-                                                       0xffffffe000000000
-  ```
+第二回映射要使用三级页表，所以我们需要管理多个页面。一个好办法是先执行 `mm.c` 中的 `mm_init` 初始化内存管理模块，然后再配置页表。当我们需要新页时，调用 `kalloc()` 申请一页即可。**注意，本次实验与之前不同， `mm_init` 运行在虚拟地址上，所以 `mm_init` 函数需要一些修改**，请你自行完成。
 
+第二回映射中，建立页表和设置 `satp` 用一个函数 `arch/riscv/kernel/vm.c : setup_vm_final` 来实现。
 
-* 不再需要进行等值映射
-* 不再需要将 OpenSBI 的映射至高地址，因为 OpenSBI 运行在 M 态， 直接使用的物理地址。
-* 采用三级页表映射。
-* 在 head.S 中 适当的位置调用 setup_vm_final 。
+完成下面的代码，并在 `head.S` 的适当位置调用 `setup_vm_final`。
+
 ```c
 // arch/riscv/kernel/vm.c 
 
@@ -339,62 +416,63 @@ create_mapping(uint64 *pgtbl, uint64 va, uint64 pa, uint64 sz, int perm) {
     */
 }
 ```
-### 4.3 编译及测试
-- 由于加入了一些新的 .c 文件，可能需要修改一些Makefile文件，请同学自己尝试修改，使项目可以编译并运行。
-- 输出示例
-    ```bash
-    OpenSBI v0.9
-      ____                    _____ ____ _____
-     / __ \                  / ____|  _ \_   _|
-    | |  | |_ __   ___ _ __ | (___ | |_) || |
-    | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
-    | |__| | |_) |  __/ | | |____) | |_) || |_
-     \____/| .__/ \___|_| |_|_____/|____/_____|
-           | |
-           |_|
+### 4.4 编译及测试
+由于加入了一些新的 C 文件，可能需要修改一些 Makefile 文件，请同学自己尝试修改，使项目可以编译并运行。
 
-    ...
+输出示例：
+```bash
+OpenSBI v0.9
+  ____                    _____ ____ _____
+ / __ \                  / ____|  _ \_   _|
+| |  | |_ __   ___ _ __ | (___ | |_) || |
+| |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+| |__| | |_) |  __/ | | |____) | |_) || |_
+ \____/| .__/ \___|_| |_|_____/|____/_____|
+       | |
+       |_|
 
-    Boot HART MIDELEG         : 0x0000000000000222
-    Boot HART MEDELEG         : 0x000000000000b109
+...
 
-    ...mm_init done!
-    ...proc_init done!
-    Hello RISC-V
-    idle process is running!
+Boot HART MIDELEG         : 0x0000000000000222
+Boot HART MEDELEG         : 0x000000000000b109
 
-    switch to [PID = 28 COUNTER = 1] 
-    [PID = 28] is running! thread space begin at 0xffffffe007fa2000
+...mm_init done!
+...proc_init done!
+Hello RISC-V
+idle process is running!
 
-    switch to [PID = 12 COUNTER = 1] 
-    [PID = 12] is running! thread space begin at 0xffffffe007fb2000
-    
-    switch to [PID = 14 COUNTER = 2] 
-    [PID = 14] is running! thread space begin at 0xffffffe007fb0000
-    [PID = 14] is running! thread space begin at 0xffffffe007fb0000
-    
-    switch to [PID = 9 COUNTER = 2] 
-    [PID = 9] is running! thread space begin at 0xffffffe007fb5000
-    [PID = 9] is running! thread space begin at 0xffffffe007fb5000
-    
-    switch to [PID = 2 COUNTER = 2] 
-    [PID = 2] is running! thread space begin at 0xffffffe007fbc000
-    [PID = 2] is running! thread space begin at 0xffffffe007fbc000
-    
-    switch to [PID = 1 COUNTER = 2] 
-    [PID = 1] is running! thread space begin at 0xffffffe007fbd000
-    [PID = 1] is running! thread space begin at 0xffffffe007fbd000
-    
-    switch to [PID = 29 COUNTER = 3] 
-    [PID = 29] is running! thread space begin at 0xffffffe007fa1000
-    [PID = 29] is running! thread space begin at 0xffffffe007fa1000
-    [PID = 29] is running! thread space begin at 0xffffffe007fa1000
-    
-    switch to [PID = 11 COUNTER = 3] 
-    [PID = 11] is running! thread space begin at 0xffffffe007fb3000
-    ...
+switch to [PID = 28 COUNTER = 1] 
+[PID = 28] is running! thread space begin at 0xffffffe007fa2000
 
-    ```
+switch to [PID = 12 COUNTER = 1] 
+[PID = 12] is running! thread space begin at 0xffffffe007fb2000
+
+switch to [PID = 14 COUNTER = 2] 
+[PID = 14] is running! thread space begin at 0xffffffe007fb0000
+[PID = 14] is running! thread space begin at 0xffffffe007fb0000
+
+switch to [PID = 9 COUNTER = 2] 
+[PID = 9] is running! thread space begin at 0xffffffe007fb5000
+[PID = 9] is running! thread space begin at 0xffffffe007fb5000
+
+switch to [PID = 2 COUNTER = 2] 
+[PID = 2] is running! thread space begin at 0xffffffe007fbc000
+[PID = 2] is running! thread space begin at 0xffffffe007fbc000
+
+switch to [PID = 1 COUNTER = 2] 
+[PID = 1] is running! thread space begin at 0xffffffe007fbd000
+[PID = 1] is running! thread space begin at 0xffffffe007fbd000
+
+switch to [PID = 29 COUNTER = 3] 
+[PID = 29] is running! thread space begin at 0xffffffe007fa1000
+[PID = 29] is running! thread space begin at 0xffffffe007fa1000
+[PID = 29] is running! thread space begin at 0xffffffe007fa1000
+
+switch to [PID = 11 COUNTER = 3] 
+[PID = 11] is running! thread space begin at 0xffffffe007fb3000
+...
+
+```
 
 ## 思考题
 1. 验证 `.text`, `.rodata` 段的属性是否成功设置，给出截图。
